@@ -107,7 +107,7 @@ jobs:
           python -c 'import json; r=json.load(open("native-g5-readiness.json")); assert r["status"] == "candidate-evidence-complete" and r["passed"] == r["required"] == 8 and r["predecessors_passed"] == r["predecessors_required"] == 3 and r["closure_declared"] is False and r["claims"] == []'
 
       - name: Upload exact-SHA G5 closure evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-g5-closure-${{ github.event.pull_request.head.sha || github.sha }}
           retention-days: 90

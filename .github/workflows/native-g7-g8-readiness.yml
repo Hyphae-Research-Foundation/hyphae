@@ -96,7 +96,7 @@ jobs:
             --bootstrap tools/bootstrap_native_g7_i7i.sh \
             --output native-g7-i7i-bootstrap-audit.json
       - name: Upload open readiness audit
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-g7-g8-readiness-${{ github.sha }}
           path: |
@@ -132,7 +132,7 @@ jobs:
             --output-dir "$RUNNER_TEMP/native-ann-durable-qualification"
       - name: Upload local durable ANN qualification evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-ann-durable-local-${{ github.sha }}
           path: ${{ runner.temp }}/native-ann-durable-qualification
@@ -272,7 +272,7 @@ jobs:
             --expected-commit "$SHA" \
             --output "$EVIDENCE_DIR/native-g7-matrix-audit.json"
       - name: Upload complete G7 matrix
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-g7-matrix-${{ inputs.g7_platform }}-${{ github.sha }}
           path: ${{ runner.temp }}/hyphae-g7-evidence/
@@ -280,7 +280,7 @@ jobs:
           retention-days: 30
       - name: Preserve G7 progress after failure
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-g7-progress-${{ inputs.g7_platform }}-${{ github.sha }}
           path: ${{ runner.temp }}/hyphae-g7-evidence/
@@ -326,7 +326,7 @@ jobs:
             --closure \
             --receipts g7-normalized
       - name: Upload exact-SHA aggregate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-g7-aggregate-${{ github.sha }}
           path: |
@@ -412,7 +412,7 @@ jobs:
             --artifact native-g8-migration.json \
             --output native-g8-migration-receipt.json
       - name: Upload Native functional evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-g8-functional-${{ matrix.platform }}-${{ github.sha }}
           path: |
@@ -462,7 +462,7 @@ jobs:
             --artifact native-g8-corruption.json \
             --output native-g8-corruption-receipt.json
       - name: Upload crash evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-g8-integrity-linux-${{ github.sha }}
           path: |
@@ -532,7 +532,7 @@ jobs:
             --artifact native-g8-power-loss.json \
             --output native-g8-power-loss-receipt.json
       - name: Upload privileged fault evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-g8-privileged-linux-${{ github.sha }}
           path: |

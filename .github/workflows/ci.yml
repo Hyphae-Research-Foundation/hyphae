@@ -218,7 +218,7 @@ jobs:
             --output "native-conformance-${{ matrix.native-platform }}.json"
       - name: Upload native conformance receipt
         if: matrix.run-native-conformance && always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-conformance-${{ matrix.native-platform }}
           path: native-conformance-${{ matrix.native-platform }}.json
@@ -254,7 +254,7 @@ jobs:
             > "security-process-crash-matrix-${{ matrix.shard }}.json"
           PYTHONPATH=. python tools/check_security_crash_matrix.py
       - name: Upload process hard-kill shard
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-process-crash-matrix-${{ matrix.shard }}
           path: security-process-crash-matrix-${{ matrix.shard }}.json
@@ -286,7 +286,7 @@ jobs:
             --receipt security-process-crash-matrix/security-process-crash-matrix-3.json \
             --expected-commit "${{ github.event.pull_request.head.sha || github.sha }}"
       - name: Upload security hard-kill aggregate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-hard-kill-${{ github.event.pull_request.head.sha || github.sha }}
           path: security-process-crash-matrix/*.json
@@ -335,7 +335,7 @@ jobs:
             --run \
             --output "native-conformance-${{ matrix.native-platform }}.json"
       - name: Upload native conformance receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-conformance-${{ matrix.native-platform }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: native-conformance-${{ matrix.native-platform }}.json
@@ -503,7 +503,7 @@ jobs:
             --allow-integration-tree
       - name: Upload MCP host receipts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mcp-real-hosts-${{ github.event.pull_request.head.sha || github.sha }}
           path: ${{ runner.temp }}/mcp-evidence
@@ -531,7 +531,7 @@ jobs:
       - name: Build the exact pure-Python wheel once
         run: uv build sdks/python --wheel --out-dir dist
       - name: Upload the exact wheel
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-managed-v2-wheel-${{ github.event.pull_request.head.sha || github.sha }}
           path: dist/hyphae_sdk-4.0.0-py3-none-any.whl
@@ -591,7 +591,7 @@ jobs:
           --output python-managed-v2-conformance-${{ matrix.platform }}.json
       - name: Upload the platform receipt
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-managed-v2-conformance-${{ matrix.platform }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: python-managed-v2-conformance-${{ matrix.platform }}.json
@@ -630,7 +630,7 @@ jobs:
             --expected-source-tree "$(git rev-parse 'HEAD^{tree}')" \
             --output python-managed-v2-conformance-aggregate.json
       - name: Upload the aggregate receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-managed-v2-conformance-aggregate-${{ github.event.pull_request.head.sha || github.sha }}
           path: python-managed-v2-conformance-aggregate.json
@@ -675,7 +675,7 @@ jobs:
             --expected-transcript python-windows-async-transcript.json
       - name: Upload the sanitized failure diagnostic
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-windows-async-failure-${{ github.event.pull_request.head.sha || github.sha }}
           path: python-windows-async-failure.json
@@ -684,7 +684,7 @@ jobs:
           overwrite: true
       - name: Upload exact-source Windows async evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-windows-async-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
